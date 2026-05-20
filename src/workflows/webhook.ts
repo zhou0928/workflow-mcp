@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { zToJsonSchema } from "../utils/schema.js";
 import type { ToolDefinition, ToolResult } from "../types.js";
-import { exec } from "../utils/exec.js";
 import { logger } from "../utils/logger.js";
 import { createServer, IncomingMessage, ServerResponse, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -27,6 +26,23 @@ const WebhookFireSchema = z.object({
 });
 
 // ============================================================
+// Signature verification helper — safe against timing attacks
+// and length-mismatch DoS
+// ============================================================
+
+function safeHmacCompare(sigHeader: string | undefined, secret: string, body: string, algorithm: string): boolean {
+  if (!sigHeader) return false;
+  const expectedPrefix = `${algorithm}=`;
+  const hmac = createHmac(algorithm === "sha256" ? "sha256" : "sha1", secret)
+    .update(body)
+    .digest("hex");
+  const expected = `${expectedPrefix}${hmac}`;
+  // Length-safe: constant-time compare only when lengths match
+  if (sigHeader.length !== expected.length) return false;
+  return timingSafeEqual(Buffer.from(sigHeader), Buffer.from(expected));
+}
+
+// ============================================================
 // Tool factory
 // ============================================================
 
@@ -38,14 +54,25 @@ export function getWebhookTools(): ToolDefinition[] {
       inputSchema: zToJsonSchema(WebhookListenSchema),
       handler: async (args) => {
         try {
-          const { port, path, timeout, secret } = WebhookListenSchema.parse(args);
+          const { port, path, secret } = WebhookListenSchema.parse(args);
           const listenPort = port ?? 8080;
           const listenPath = path ?? "/webhook";
-          const maxDuration = Math.min(timeout ?? 300, 3600) * 1000;
+          const maxDuration = Math.min(args.timeout as number | undefined ?? 300, 3600) * 1000;
+          const stopPath = `${listenPath}/stop`;
           const received: string[] = [];
 
           return new Promise((resolve) => {
             const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+              // Handle manual stop request FIRST
+              if (req.url === stopPath && req.method === "POST") {
+                server.close();
+                resolve({
+                  content: [{ type: "text", text: `⏹️ Webhook listener on port ${listenPort} stopped manually after ${received.length} request(s).\n${received.map((r) => `  ${r}`).join("\n")}` }],
+                });
+                return;
+              }
+
+              // Only accept POST to the configured path
               if (req.url !== listenPath || req.method !== "POST") {
                 res.writeHead(404);
                 res.end("Not found");
@@ -59,28 +86,31 @@ export function getWebhookTools(): ToolDefinition[] {
 
                 // Verify signature if secret provided
                 if (secret) {
-                  const signature = req.headers["x-hub-signature-256"] as string;
-                  if (signature) {
-                    const hmac = createHmac("sha256", secret).update(body).digest("hex");
-                    const expected = `sha256=${hmac}`;
-                    if (!timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
-                      res.writeHead(401);
-                      res.end("Signature mismatch");
-                      received.push(`[${new Date().toISOString()}] ❌ INVALID SIGNATURE`);
-                      return;
-                    }
+                  const sig256 = req.headers["x-hub-signature-256"] as string | undefined;
+                  const sig1 = req.headers["x-hub-signature"] as string | undefined;
+
+                  // At least one signature header must be present
+                  if (!sig256 && !sig1) {
+                    res.writeHead(401);
+                    res.end("Signature required");
+                    received.push(`[${new Date().toISOString()}] ❌ MISSING SIGNATURE`);
+                    return;
                   }
-                  // GitHub also sends x-hub-signature (SHA1)
-                  const sig1 = req.headers["x-hub-signature"] as string;
-                  if (sig1) {
-                    const hmac1 = createHmac("sha1", secret).update(body).digest("hex");
-                    const expected1 = `sha1=${hmac1}`;
-                    if (!timingSafeEqual(Buffer.from(sig1), Buffer.from(expected1))) {
-                      res.writeHead(401);
-                      res.end("Signature mismatch");
-                      received.push(`[${new Date().toISOString()}] ❌ INVALID SIGNATURE`);
-                      return;
-                    }
+
+                  // Verify sha256 signature (preferred)
+                  if (sig256 && !safeHmacCompare(sig256, secret, body, "sha256")) {
+                    res.writeHead(401);
+                    res.end("Signature mismatch");
+                    received.push(`[${new Date().toISOString()}] ❌ INVALID SIGNATURE (sha256)`);
+                    return;
+                  }
+
+                  // Fallback to sha1 if sha256 wasn't present
+                  if (!sig256 && sig1 && !safeHmacCompare(sig1, secret, body, "sha1")) {
+                    res.writeHead(401);
+                    res.end("Signature mismatch");
+                    received.push(`[${new Date().toISOString()}] ❌ INVALID SIGNATURE (sha1)`);
+                    return;
                   }
                 }
 
@@ -120,16 +150,7 @@ export function getWebhookTools(): ToolDefinition[] {
             }, maxDuration);
 
             // Allow early stop via a special request
-            server.on("request", (req, res) => {
-              if (req.url === `${listenPath}/stop` && req.method === "POST") {
-                clearTimeout(timer);
-                server.close();
-                res.end(JSON.stringify({ status: "stopped" }));
-                resolve({
-                  content: [{ type: "text", text: `⏹️ Webhook listener on port ${listenPort} stopped manually after ${received.length} request(s).\n${received.map((r) => `  ${r}`).join("\n")}` }],
-                });
-              }
-            });
+            server.on("close", () => clearTimeout(timer));
           });
         } catch (err) {
           const message = err instanceof z.ZodError ? err.errors.map((e) => e.message).join(", ") : String(err);
