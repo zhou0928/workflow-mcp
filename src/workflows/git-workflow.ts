@@ -8,7 +8,7 @@ import {
   GitAutoCommitSchema,
   GitSyncForkSchema,
 } from "../types.js";
-import { exec, findGitRoot } from "../utils/exec.js";
+import { execSafe, findGitRoot } from "../utils/exec.js";
 import { logger } from "../utils/logger.js";
 
 function ensureGitRepo(cwd?: string): string {
@@ -32,7 +32,7 @@ export function getGitWorkflowTools(): ToolDefinition[] {
           logger.info(`Creating branch ${newBranchName} from ${baseBranch}`);
 
           // Fetch latest and checkout base
-          const fetchResult = exec(`git fetch origin ${baseBranch}`, { cwd: gitRoot });
+          const fetchResult = execSafe("git", ["fetch", "origin", baseBranch], { cwd: gitRoot });
           if (fetchResult.exitCode !== 0) {
             return {
               content: [{ type: "text", text: `Failed to fetch: ${fetchResult.stderr}` }],
@@ -40,7 +40,7 @@ export function getGitWorkflowTools(): ToolDefinition[] {
             };
           }
 
-          const checkoutResult = exec(`git checkout ${baseBranch}`, { cwd: gitRoot });
+          const checkoutResult = execSafe("git", ["checkout", baseBranch], { cwd: gitRoot });
           if (checkoutResult.exitCode !== 0) {
             return {
               content: [{ type: "text", text: `Failed to checkout ${baseBranch}: ${checkoutResult.stderr}` }],
@@ -48,7 +48,7 @@ export function getGitWorkflowTools(): ToolDefinition[] {
             };
           }
 
-          const pullResult = exec(`git pull origin ${baseBranch}`, { cwd: gitRoot });
+          const pullResult = execSafe("git", ["pull", "origin", baseBranch], { cwd: gitRoot });
           if (pullResult.exitCode !== 0) {
             return {
               content: [{ type: "text", text: `Failed to pull: ${pullResult.stderr}` }],
@@ -56,7 +56,7 @@ export function getGitWorkflowTools(): ToolDefinition[] {
             };
           }
 
-          const branchResult = exec(`git checkout -b ${newBranchName}`, { cwd: gitRoot });
+          const branchResult = execSafe("git", ["checkout", "-b", newBranchName], { cwd: gitRoot });
           if (branchResult.exitCode !== 0) {
             return {
               content: [{ type: "text", text: `Failed to create branch: ${branchResult.stderr}` }],
@@ -88,9 +88,10 @@ export function getGitWorkflowTools(): ToolDefinition[] {
           const gitRoot = ensureGitRepo();
           logger.info(`Creating PR: ${title}`);
 
-          const ghResult = exec(`gh pr create --title ${JSON.stringify(title)} --base ${base} --head ${head}${body ? ` --body ${JSON.stringify(body)}` : ""}${draft ? " --draft" : ""}`, {
-            cwd: gitRoot,
-          });
+          const ghArgs = ["pr", "create", "--title", title, "--base", base, "--head", head];
+          if (body) { ghArgs.push("--body", body); }
+          if (draft) { ghArgs.push("--draft"); }
+          const ghResult = execSafe("gh", ghArgs, { cwd: gitRoot });
 
           if (ghResult.exitCode !== 0) {
             return {
@@ -119,27 +120,27 @@ export function getGitWorkflowTools(): ToolDefinition[] {
           logger.info(`Merging ${sourceBranch} into ${targetBranch}`);
 
           // Ensure we are on target branch and it's up-to-date
-          let r = exec(`git checkout ${targetBranch}`, { cwd: gitRoot });
+          let r = execSafe("git", ["checkout", targetBranch], { cwd: gitRoot });
           if (r.exitCode !== 0) {
             return { content: [{ type: "text", text: `Failed to checkout ${targetBranch}: ${r.stderr}` }], isError: true };
           }
 
-          r = exec(`git pull origin ${targetBranch}`, { cwd: gitRoot });
+          r = execSafe("git", ["pull", "origin", targetBranch], { cwd: gitRoot });
           if (r.exitCode !== 0) {
             return { content: [{ type: "text", text: `Failed to pull ${targetBranch}: ${r.stderr}` }], isError: true };
           }
 
           const mergeMethod = method ?? "merge";
-          let mergeResult: ReturnType<typeof exec>;
+          let mergeResult: ReturnType<typeof execSafe>;
           if (mergeMethod === "squash") {
-            mergeResult = exec(`git merge --squash ${sourceBranch}`, { cwd: gitRoot });
+            mergeResult = execSafe("git", ["merge", "--squash", sourceBranch], { cwd: gitRoot });
             if (mergeResult.exitCode === 0) {
-              exec(`git commit -m "squash: merge ${sourceBranch} into ${targetBranch}"`, { cwd: gitRoot });
+              execSafe("git", ["commit", "-m", `squash: merge ${sourceBranch} into ${targetBranch}`], { cwd: gitRoot });
             }
           } else if (mergeMethod === "rebase") {
-            mergeResult = exec(`git rebase ${sourceBranch}`, { cwd: gitRoot });
+            mergeResult = execSafe("git", ["rebase", sourceBranch], { cwd: gitRoot });
           } else {
-            mergeResult = exec(`git merge ${sourceBranch} --no-ff`, { cwd: gitRoot });
+            mergeResult = execSafe("git", ["merge", sourceBranch, "--no-ff"], { cwd: gitRoot });
           }
 
           if (mergeResult.exitCode !== 0) {
@@ -169,14 +170,14 @@ export function getGitWorkflowTools(): ToolDefinition[] {
           logger.info("Auto-committing changes");
 
           if (addAll) {
-            const addResult = exec("git add -A", { cwd: gitRoot });
+            const addResult = execSafe("git", ["add", "-A"], { cwd: gitRoot });
             if (addResult.exitCode !== 0) {
               return { content: [{ type: "text", text: `Failed to stage files: ${addResult.stderr}` }], isError: true };
             }
           }
 
           // Check if there's anything to commit
-          const statusResult = exec("git status --porcelain", { cwd: gitRoot });
+          const statusResult = execSafe("git", ["status", "--porcelain"], { cwd: gitRoot });
           if (!statusResult.stdout) {
             return { content: [{ type: "text", text: "No changes to commit." }] };
           }
@@ -186,7 +187,7 @@ export function getGitWorkflowTools(): ToolDefinition[] {
           const commitMsg = message ?? `Auto-commit: ${new Date().toISOString().split("T")[0]}`;
           const fullMsg = `${commitType}: ${commitMsg}`;
 
-          const commitResult = exec(`git commit -m ${JSON.stringify(fullMsg)}`, { cwd: gitRoot });
+          const commitResult = execSafe("git", ["commit", "-m", fullMsg], { cwd: gitRoot });
           if (commitResult.exitCode !== 0) {
             return { content: [{ type: "text", text: `Commit failed: ${commitResult.stderr}` }], isError: true };
           }
@@ -208,20 +209,20 @@ export function getGitWorkflowTools(): ToolDefinition[] {
         try {
           const { upstreamRemote, branch } = GitSyncForkSchema.parse(args);
           const gitRoot = ensureGitRepo();
-          const targetBranch = branch ?? exec("git rev-parse --abbrev-ref HEAD", { cwd: gitRoot }).stdout;
+          const targetBranch = branch ?? execSafe("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: gitRoot }).stdout;
           logger.info(`Syncing fork from ${upstreamRemote}`);
 
-          let r = exec(`git fetch ${upstreamRemote} ${targetBranch}`, { cwd: gitRoot });
+          let r = execSafe("git", ["fetch", upstreamRemote, targetBranch], { cwd: gitRoot });
           if (r.exitCode !== 0) {
             return { content: [{ type: "text", text: `Failed to fetch upstream: ${r.stderr}` }], isError: true };
           }
 
-          r = exec(`git checkout ${targetBranch}`, { cwd: gitRoot });
+          r = execSafe("git", ["checkout", targetBranch], { cwd: gitRoot });
           if (r.exitCode !== 0) {
             return { content: [{ type: "text", text: `Failed to checkout ${targetBranch}: ${r.stderr}` }], isError: true };
           }
 
-          r = exec(`git merge ${upstreamRemote}/${targetBranch}`, { cwd: gitRoot });
+          r = execSafe("git", ["merge", `${upstreamRemote}/${targetBranch}`], { cwd: gitRoot });
           if (r.exitCode !== 0) {
             return { content: [{ type: "text", text: `Merge failed: ${r.stderr}` }], isError: true };
           }

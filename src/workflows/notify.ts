@@ -2,13 +2,11 @@ import { z } from "zod";
 import { zToJsonSchema } from "../utils/schema.js";
 import type { ToolDefinition } from "../types.js";
 import { NotificationSendSchema, NotificationSendMultiSchema, NotificationListChannelsSchema } from "../types.js";
-import { exec } from "../utils/exec.js";
-import { logger } from "../utils/logger.js";
-import { createHmac, randomUUID } from "node:crypto";
-import { request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
+import { execSafe, commandExists } from "../utils/exec.js";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -94,15 +92,15 @@ function httpPost(url: string, body: string): Promise<void> {
 }
 
 function sendEmail(smtpConfig: Record<string, string>, to: string, subject: string, body: string): string {
-  // Uses system `sendmail` or `mail` command as a zero-dependency fallback
-  const mailCmd = exec("which mail sendmail 2>/dev/null || echo none", { timeout: 5_000 });
-  const available = mailCmd.stdout.trim();
+  // Use Node.js native methods instead of shell commands
+  const mailAvail = commandExists("mail") ? "mail" : commandExists("sendmail") ? "sendmail" : null;
 
-  if (available && available !== "none") {
+  if (mailAvail) {
     const sender = smtpConfig["from"] ?? "workflow-mcp@localhost";
-    const result = exec(
-      `echo "${body.replace(/"/g, '\\"')}" | ${available} -s "${subject.replace(/"/g, '\\"')}" -a "From: ${sender}" "${to}"`,
-      { timeout: 15_000 },
+    const result = execSafe(
+      mailAvail,
+      ["-s", subject, "-a", `From: ${sender}`, to],
+      { input: body, timeout: 15_000 },
     );
     return result.exitCode === 0
       ? `✅ Email sent to ${to}`
@@ -112,8 +110,11 @@ function sendEmail(smtpConfig: Record<string, string>, to: string, subject: stri
   // Fallback: write to file
   const logDir = process.env.HOME ? join(process.env.HOME, ".workflow-mcp", "mail") : "/tmp/workflow-mcp-mail";
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const content = [`From: ${smtpConfig["from"] ?? "workflow-mcp@localhost"}`, `To: ${to}`, `Subject: ${subject}`, "", body].join("\n");
-  exec(`mkdir -p '${logDir}' && echo '${content.replace(/'/g, "'\\''")}' > '${logDir}/${timestamp}.eml'`, { timeout: 5_000 });
+  const sender = smtpConfig["from"] ?? "workflow-mcp@localhost";
+  const content = [`From: ${sender}`, `To: ${to}`, `Subject: ${subject}`, "", body].join("\n");
+  mkdirSync(logDir, { recursive: true });
+  const outPath = join(logDir, `${timestamp}.eml`);
+  writeFileSync(outPath, content, "utf-8");
   return `⚠️  No mail command available. Saved draft to ${logDir}/${timestamp}.eml`;
 }
 

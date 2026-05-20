@@ -2,7 +2,7 @@ import { z } from "zod";
 import { zToJsonSchema } from "../utils/schema.js";
 import type { ToolDefinition } from "../types.js";
 import { ReviewRunLintSchema, ReviewRunTestsSchema, ReviewGenerateReportSchema, ReviewCheckStyleSchema } from "../types.js";
-import { exec, detectProjectToolchain } from "../utils/exec.js";
+import { execSafe, detectProjectToolchain } from "../utils/exec.js";
 import { logger } from "../utils/logger.js";
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -38,7 +38,7 @@ export function getCodeReviewTools(): ToolDefinition[] {
           const fixFlag = fix ? (linter === "eslint" ? " --fix" : " --fix") : "";
           const cmd = linter === "eslint" ? `npx eslint .${fixFlag}` : `npx biome check .${fixFlag}`;
 
-          const result = exec(cmd, { cwd: directory, timeout: 120_000 });
+          const result = execSafe(cmd.split(" ")[0], cmd.split(" ").slice(1), { cwd: directory, timeout: 120_000 });
 
           const lines: string[] = [];
           if (result.exitCode === 0) {
@@ -70,18 +70,16 @@ export function getCodeReviewTools(): ToolDefinition[] {
 
           const toolchain = detectProjectToolchain(directory);
 
-          let cmd: string;
+          let result: ReturnType<typeof execSafe>;
           if (command) {
-            cmd = command;
+            // User-supplied command — split into command + args
+            const parts = command.split(/\s+/);
+            result = execSafe(parts[0], parts.slice(1), { cwd: directory, timeout: 300_000 });
           } else if (testPattern) {
-            cmd = `npx vitest run ${testPattern}`;
+            result = execSafe("npx", ["vitest", "run", testPattern], { cwd: directory, timeout: 300_000 });
           } else {
-            cmd = coverage
-              ? `npx vitest run --coverage`
-              : `npx vitest run`;
+            result = execSafe("npx", ["vitest", "run", ...(coverage ? ["--coverage"] : [])], { cwd: directory, timeout: 300_000 });
           }
-
-          const result = exec(cmd, { cwd: directory, timeout: 300_000 });
 
           const lines: string[] = [];
           lines.push(result.exitCode === 0 ? "✅ Tests passed." : "❌ Tests failed.");
@@ -119,8 +117,8 @@ export function getCodeReviewTools(): ToolDefinition[] {
           // Lint
           if (includeLint !== false && toolchain.linter) {
             reportLines.push("## Lint Results");
-            const lintCmd = toolchain.linter === "eslint" ? "npx eslint ." : "npx biome check .";
-            const lintResult = exec(lintCmd, { cwd: directory, timeout: 120_000 });
+            const lintArgs = toolchain.linter === "eslint" ? ["eslint", "."] : ["biome", "check", "."];
+            const lintResult = execSafe("npx", lintArgs, { cwd: directory, timeout: 120_000 });
             reportLines.push(`Status: ${lintResult.exitCode === 0 ? "✅ Passed" : "❌ Issues found"}`);
             if (lintResult.stdout) reportLines.push(`\`\`\`\n${lintResult.stdout.slice(0, 2000)}\n\`\`\``);
             reportLines.push("");
@@ -129,7 +127,7 @@ export function getCodeReviewTools(): ToolDefinition[] {
           // Tests
           if (includeTests !== false && toolchain.testRunner) {
             reportLines.push("## Test Results");
-            const testResult = exec("npx vitest run 2>&1", { cwd: directory, timeout: 300_000 });
+            const testResult = execSafe("npx", ["vitest", "run"], { cwd: directory, timeout: 300_000 });
             reportLines.push(`Status: ${testResult.exitCode === 0 ? "✅ Passed" : "❌ Failed"}`);
             const testOutput = testResult.stdout || testResult.stderr;
             if (testOutput) reportLines.push(`\`\`\`\n${testOutput.slice(0, 3000)}\n\`\`\``);
@@ -139,7 +137,7 @@ export function getCodeReviewTools(): ToolDefinition[] {
           // Dependency audit
           if (includeDeps !== false) {
             reportLines.push("## Dependency Audit");
-            const auditResult = exec("npm audit --omit=dev 2>&1 || true", { cwd: directory, timeout: 60_000 });
+            const auditResult = execSafe("npm", ["audit", "--omit=dev"], { cwd: directory, timeout: 60_000 });
             if (auditResult.stdout) reportLines.push(`\`\`\`\n${auditResult.stdout.slice(0, 2000)}\n\`\`\``);
             reportLines.push("");
           }
@@ -184,16 +182,20 @@ export function getCodeReviewTools(): ToolDefinition[] {
             };
           }
 
-          const configFlag = config ? (formatter === "prettier" ? ` --config ${config}` : ` --config-path ${config}`) : "";
-          const checkFlag = check ? (formatter === "prettier" ? " --check" : " --ci") : "";
-          const writeFlag = !check ? (formatter === "prettier" ? " --write" : " format --write") : "";
-
-          const cmd =
-            formatter === "prettier"
-              ? `npx prettier .${configFlag}${checkFlag}${!check ? " --write" : ""}`
-              : `npx biome ${checkFlag ? "ci" : "format"}${configFlag}${writeFlag} .`;
-
-          const result = exec(cmd, { cwd: directory, timeout: 120_000 });
+          let result: ReturnType<typeof execSafe>;
+          if (formatter === "prettier") {
+            const args = ["prettier", "."];
+            if (config) { args.push("--config", config); }
+            if (check) { args.push("--check"); } else { args.push("--write"); }
+            result = execSafe("npx", args, { cwd: directory, timeout: 120_000 });
+          } else {
+            const args = ["biome"];
+            if (check) { args.push("ci"); } else { args.push("format"); }
+            if (config) { args.push("--config-path", config); }
+            if (!check) { args.push("--write"); }
+            args.push(".");
+            result = execSafe("npx", args, { cwd: directory, timeout: 120_000 });
+          }
 
           const lines: string[] = [];
           if (result.exitCode === 0) {

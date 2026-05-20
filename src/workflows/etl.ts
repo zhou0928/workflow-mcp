@@ -2,7 +2,7 @@ import { z } from "zod";
 import { zToJsonSchema } from "../utils/schema.js";
 import type { ToolDefinition } from "../types.js";
 import { EtlExtractSchema, EtlTransformSchema, EtlLoadSchema, EtlRunPipelineSchema } from "../types.js";
-import { exec } from "../utils/exec.js";
+import { execSafe } from "../utils/exec.js";
 import { logger } from "../utils/logger.js";
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, createReadStream, createWriteStream } from "node:fs";
 import { join, dirname, extname, basename } from "node:path";
@@ -101,7 +101,7 @@ function runExtract(sourceType: string, sourceConfig: Record<string, string>, qu
     case "api": {
       const url = sourceConfig["url"];
       if (!url) throw new Error("API URL required");
-      const result = exec(`curl -s "${url}"`, { timeout: 30_000 });
+      const result = execSafe("curl", ["-s", url], { timeout: 30_000 });
       if (result.exitCode !== 0) throw new Error(`API request failed: ${result.stderr}`);
       return [{ data: result.stdout }];
     }
@@ -343,7 +343,8 @@ export function getEtlTools(): ToolDefinition[] {
               const url = destinationConfig["url"];
               if (!url) return { content: [{ type: "text", text: "API URL required for API destination." }], isError: true };
               const method = (destinationConfig["method"] ?? "POST").toUpperCase();
-              const result = exec(`curl -s -X ${method} "${url}" -H "Content-Type: application/json" -d ${JSON.stringify(JSON.stringify(JSON.parse(content)))}`, { timeout: 60_000 });
+              const curlArgs = ["-s", "-X", method, url, "-H", "Content-Type: application/json", "-d", JSON.stringify(JSON.parse(content))];
+              const result = execSafe("curl", curlArgs, { timeout: 60_000 });
               if (result.exitCode !== 0) {
                 return { content: [{ type: "text", text: `API load failed: ${result.stderr}` }], isError: true };
               }

@@ -1,10 +1,10 @@
 import { z } from "zod";
 import { zToJsonSchema } from "../utils/schema.js";
 import type { ToolDefinition } from "../types.js";
-import { exec } from "../utils/exec.js";
-import { logger } from "../utils/logger.js";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { execSafe } from "../utils/exec.js";
+import { existsSync, readFileSync, statSync, readdirSync, unlinkSync, renameSync, copyFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 
 // ============================================================
 // Schemas
@@ -41,7 +41,7 @@ const LogAnalyzeSchema = z.object({
 const LogWatchSchema = z.object({
   directory: z.string().describe("Directory to watch for log files"),
   pattern: z.string().optional().describe("File glob pattern (default: '*.log')"),
-  keywords: z.array(z.string()).optional().describe("Keywords to alert on"),
+  keywords: z.array(z.string()).optional().describe("Keywords to alert on (default: ['error', 'fatal', 'exception', 'fail'])"),
   duration: z.number().optional().describe("Watch duration in seconds (default: 60)"),
 });
 
@@ -68,6 +68,47 @@ function parseMaxSize(size: string): number {
   }
 }
 
+/**
+ * Recursively find files matching a simple glob pattern (only * and ? supported).
+ */
+function findFiles(dir: string, patternGlob: string, maxResults = 20): string[] {
+  const results: string[] = [];
+  // Convert glob to regex: * → .*, ? → .
+  const regexStr = "^" + patternGlob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$";
+  const regex = new RegExp(regexStr);
+
+  function walk(current: string) {
+    if (results.length >= maxResults) return;
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (results.length >= maxResults) break;
+      const fullPath = join(current, entry.name);
+      if (entry.isDirectory()) {
+        walk(fullPath);
+      } else if (entry.isFile() && regex.test(entry.name)) {
+        results.push(fullPath);
+      }
+    }
+  }
+
+  walk(dir);
+  return results;
+}
+
+/**
+ * Read the last N lines of a file.
+ */
+function tailLines(filePath: string, n: number): string[] {
+  const content = readFileSync(filePath, "utf-8");
+  const lines = content.split("\n");
+  return lines.slice(-n);
+}
+
 // ============================================================
 // Tool factory
 // ============================================================
@@ -80,7 +121,7 @@ export function getLogTools(): ToolDefinition[] {
       inputSchema: zToJsonSchema(LogTailSchema),
       handler: async (args) => {
         try {
-          const { file, lines, follow, timeout } = LogTailSchema.parse(args);
+          const { file, lines } = LogTailSchema.parse(args);
           const numLines = Math.min(lines ?? 50, 5000);
 
           if (!existsSync(file)) {
@@ -92,20 +133,12 @@ export function getLogTools(): ToolDefinition[] {
             return { content: [{ type: "text", text: `❌ Not a file: ${file}` }], isError: true };
           }
 
-          const t = follow ? (timeout ?? 30) : 10;
-          const cmd = follow
-            ? `tail -n ${numLines} -f '${file}' & PID=$!; sleep ${t}; kill $PID 2>/dev/null; wait $PID 2>/dev/null`
-            : `tail -n ${numLines} '${file}'`;
-
-          const result = exec(cmd, { timeout: (t + 5) * 1000 });
-
-          if (result.exitCode !== 0 && result.stderr && !result.stderr.includes("killed") && !result.stderr.includes("Terminated")) {
-            return { content: [{ type: "text", text: `❌ Failed to read log.\n${result.stderr}` }], isError: true };
-          }
+          const recentLines = tailLines(file, numLines);
+          const result = recentLines.join("\n");
 
           const info = `File: ${file} (${formatSize(stat.size)})`;
           return {
-            content: [{ type: "text", text: [info, "", result.stdout.slice(0, 10000)].join("\n") }],
+            content: [{ type: "text", text: [info, "", result.slice(0, 10000)].join("\n") }],
           };
         } catch (err) {
           const message = err instanceof z.ZodError ? err.errors.map((e) => e.message).join(", ") : String(err);
@@ -127,22 +160,46 @@ export function getLogTools(): ToolDefinition[] {
             return { content: [{ type: "text", text: `❌ File not found: ${file}` }], isError: true };
           }
 
-          const caseFlag = ignoreCase ?? true ? "-i" : "";
-          const cmd = `grep -n ${caseFlag} -C ${ctx} '${pattern.replace(/'/g, "'\\''")}' '${file}' | head -n ${max * (ctx * 2 + 1)}`;
+          const flags = ignoreCase !== false ? "gi" : "g";
+          const regex = new RegExp(pattern, flags);
+          const content = readFileSync(file, "utf-8");
+          const lines = content.split("\n");
 
-          const result = exec(cmd, { timeout: 30_000 });
-
-          if (result.exitCode === 1 && !result.stdout) {
-            return { content: [{ type: "text", text: `No matches found for pattern: ${pattern}` }] };
+          // Collect context groups around each match
+          const matchGroups: Set<number>[] = [];
+          let matchCount = 0;
+          for (let i = 0; i < lines.length; i++) {
+            regex.lastIndex = 0;
+            if (regex.test(lines[i])) {
+              const start = Math.max(0, i - ctx);
+              const end = Math.min(lines.length - 1, i + ctx);
+              const group = new Set<number>();
+              for (let j = start; j <= end; j++) group.add(j);
+              matchGroups.push(group);
+              matchCount++;
+              if (matchCount >= max) break;
+            }
           }
 
-          if (result.exitCode !== 0 && result.exitCode !== 1) {
-            return { content: [{ type: "text", text: `❌ Search failed.\n${result.stderr}` }], isError: true };
+          // Merge overlapping/sorted groups and format output
+          const outputLines: string[] = [];
+          let prevEnd = -2;
+          for (const group of matchGroups) {
+            const indices = [...group].sort((a, b) => a - b);
+            if (prevEnd >= indices[0] - 1) {
+              // Overlapping — just keep the output going
+            } else {
+              if (outputLines.length > 0) outputLines.push("--");
+            }
+            for (const idx of indices) {
+              outputLines.push(`${idx + 1}:${lines[idx]}`);
+            }
+            prevEnd = indices[indices.length - 1];
           }
 
-          const matchCount = result.stdout.split("\n").filter((l) => l.match(/^\d+:/)).length;
+          const output = outputLines.join("\n");
           return {
-            content: [{ type: "text", text: `🔍 Found ${matchCount} match(es) for "${pattern}" in ${file}\n\n${result.stdout.slice(0, 10000)}` }],
+            content: [{ type: "text", text: `🔍 Found ${matchCount} match(es) for "${pattern}" in ${file}\n\n${output.slice(0, 10000)}` }],
           };
         } catch (err) {
           const message = err instanceof z.ZodError ? err.errors.map((e) => e.message).join(", ") : String(err);
@@ -169,15 +226,12 @@ export function getLogTools(): ToolDefinition[] {
             return { content: [{ type: "text", text: `File size (${formatSize(stat.size)}) is below max (${maxSize ?? "100M"}). No rotation needed.` }] };
           }
 
-          // Rotate: remove oldest, shift existing, compress
-          const dir = file.substring(0, file.lastIndexOf("/")) || ".";
-          const base = file.substring(file.lastIndexOf("/") + 1);
-
           // Remove oldest if over limit
           if (keepCount > 0) {
             const oldest = `${file}.${keepCount}`;
-            if (existsSync(oldest)) exec(`rm -f '${oldest}'`, { timeout: 5_000 });
-            if (compress && existsSync(`${oldest}.gz`)) exec(`rm -f '${oldest}.gz'`, { timeout: 5_000 });
+            if (existsSync(oldest)) unlinkSync(oldest);
+            const oldestGz = `${oldest}.gz`;
+            if (compress && existsSync(oldestGz)) unlinkSync(oldestGz);
           }
 
           // Shift existing
@@ -185,17 +239,19 @@ export function getLogTools(): ToolDefinition[] {
             const src = `${file}.${i}`;
             const srcGz = `${file}.${i}.gz`;
             const dst = `${file}.${i + 1}`;
-            if (existsSync(src)) exec(`mv '${src}' '${dst}'`, { timeout: 5_000 });
-            if (compress && existsSync(srcGz)) exec(`mv '${srcGz}' '${dst}.gz'`, { timeout: 5_000 });
+            if (existsSync(src)) renameSync(src, dst);
+            if (compress && existsSync(srcGz)) renameSync(srcGz, `${dst}.gz`);
           }
 
           // Rotate current
-          exec(`cp '${file}' '${file}.1'`, { timeout: 10_000 });
-          exec(`: > '${file}'`, { timeout: 5_000 });
+          copyFileSync(file, `${file}.1`);
+          writeFileSync(file, "");
 
           // Compress
           if (compress) {
-            exec(`gzip -f '${file}.1'`, { timeout: 30_000 });
+            const data = readFileSync(`${file}.1`);
+            writeFileSync(`${file}.1.gz`, gzipSync(data));
+            unlinkSync(`${file}.1`);
           }
 
           return {
@@ -220,40 +276,45 @@ export function getLogTools(): ToolDefinition[] {
           }
 
           const stat = statSync(file);
-          const totalLines = exec(`wc -l < '${file}'`, { timeout: 10_000 });
-          const lineCount = parseInt(totalLines.stdout || "0");
+          const content = readFileSync(file, "utf-8");
+          const lineCount = content.split("\n").length;
 
-          // Count by log level
-          const errorCount = exec(`grep -ciE '\\berror\\b|\\bfatal\\b|\\bexception\\b|\\bFAIL\\b' '${file}'`, { timeout: 30_000 });
-          const warnCount = exec(`grep -ciE '\\bwarn\\b|\\bwarning\\b' '${file}'`, { timeout: 30_000 });
-          const infoCount = exec(`grep -ciE '\\binfo\\b' '${file}'`, { timeout: 30_000 });
-          const debugCount = exec(`grep -ciE '\\bdebug\\b|\\btrace\\b' '${file}'`, { timeout: 30_000 });
+          // Count by log level (case-insensitive)
+          const errorCount = (content.match(/\berror\b|\bfatal\b|\bexception\b|\bFAIL\b/gi) || []).length;
+          const warnCount = (content.match(/\bwarn\b|\bwarning\b/gi) || []).length;
+          const infoCount = (content.match(/\binfo\b/gi) || []).length;
+          const debugCount = (content.match(/\bdebug\b|\btrace\b/gi) || []).length;
 
-          const errors = parseInt(errorCount.stdout || "0");
-          const warns = parseInt(warnCount.stdout || "0");
-          const infos = parseInt(infoCount.stdout || "0");
-          const debugs = parseInt(debugCount.stdout || "0");
+          // Top error patterns: find lines with "error", extract unique error-like snippets
+          const errorLines = content.split("\n").filter((l) => /\berror\b/i.test(l));
+          const errorPatternMap: Record<string, number> = {};
+          for (const line of errorLines) {
+            const m = line.match(/\berror[^:;,]*/i);
+            if (m) {
+              const key = m[0].trim().toLowerCase();
+              errorPatternMap[key] = (errorPatternMap[key] || 0) + 1;
+            }
+          }
+          const topErrorEntries = Object.entries(errorPatternMap)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 10);
 
-          // Top error messages
-          const topErrors = exec(`grep -ioE '(error|fatal|exception)[^.!?\\n]*' '${file}' | sort | uniq -c | sort -rn | head -10`, { timeout: 30_000 });
-
-          const report = [
+          const report: string[] = [
             `📊 Log Analysis: ${file}`,
             `   Size: ${formatSize(stat.size)}`,
             `   Total lines: ${lineCount}`,
             ``,
-            `   Log Level Breakdown:`,
-            `     ❌ Errors:   ${errors}${lineCount > 0 ? ` (${(errors / lineCount * 100).toFixed(1)}%)` : ""}`,
-            `     ⚠️  Warnings: ${warns}${lineCount > 0 ? ` (${(warns / lineCount * 100).toFixed(1)}%)` : ""}`,
-            `     ℹ️  Info:     ${infos}${lineCount > 0 ? ` (${(infos / lineCount * 100).toFixed(1)}%)` : ""}`,
-            `     🔍 Debug:    ${debugs}${lineCount > 0 ? ` (${(debugs / lineCount * 100).toFixed(1)}%)` : ""}`,
+            `   🔴 Errors:   ${errorCount}${lineCount > 0 ? ` (${(errorCount / lineCount * 100).toFixed(1)}%)` : ""}`,
+            `   🟡 Warnings: ${warnCount}${lineCount > 0 ? ` (${(warnCount / lineCount * 100).toFixed(1)}%)` : ""}`,
+            `   🔵 Info:     ${infoCount}${lineCount > 0 ? ` (${(infoCount / lineCount * 100).toFixed(1)}%)` : ""}`,
+            `     🔍 Debug:    ${debugCount}${lineCount > 0 ? ` (${(debugCount / lineCount * 100).toFixed(1)}%)` : ""}`,
           ];
 
-          if (topErrors.stdout.trim()) {
+          if (topErrorEntries.length > 0) {
             report.push(``, `   Top Error Patterns:`);
-            topErrors.stdout.trim().split("\n").slice(0, 10).forEach((line) => {
-              report.push(`     ${line.trim()}`);
-            });
+            for (const [pattern, count] of topErrorEntries) {
+              report.push(`     ${count} ${pattern}`);
+            }
           }
 
           return { content: [{ type: "text", text: report.join("\n") }] };
@@ -271,33 +332,30 @@ export function getLogTools(): ToolDefinition[] {
         try {
           const { directory, pattern, keywords, duration } = LogWatchSchema.parse(args);
           const glob = pattern ?? "*.log";
-          const dur = duration ?? 60;
           const kw = keywords ?? ["error", "fatal", "exception", "fail"];
 
           if (!existsSync(directory)) {
             return { content: [{ type: "text", text: `❌ Directory not found: ${directory}` }], isError: true };
           }
 
-          // Find matching log files
-          const findCmd = `find '${directory}' -name '${glob}' -type f 2>/dev/null | head -20`;
-          const files = exec(findCmd, { timeout: 10_000 });
+          // Find matching log files using recursive walk
+          const logFiles = findFiles(directory, glob, 20);
 
-          const logFiles = files.stdout.trim().split("\n").filter(Boolean);
           if (logFiles.length === 0) {
             return { content: [{ type: "text", text: `No log files matching "${glob}" found in ${directory}.` }] };
           }
 
-          // Build keyword grep pattern
+          // Build keyword regex
           const kwPattern = kw.map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
-          const results: string[] = [`👁️  Watching ${logFiles.length} log file(s) for ${dur}s`, `   Keywords: ${kw.join(", ")}`, ""];
+          const kwRegex = new RegExp(kwPattern, "i");
+          const results: string[] = [`👁️  Scanning ${logFiles.length} log file(s)`, `   Keywords: ${kw.join(", ")}`, ""];
           let totalMatches = 0;
 
           for (const logFile of logFiles) {
-            const grepCmd = `tail -f '${logFile}' 2>/dev/null & PID=$!; sleep ${dur}; kill $PID 2>/dev/null; wait $PID 2>/dev/null | grep -iE '${kwPattern}' || true`;
-            const result = exec(grepCmd, { timeout: (dur + 5) * 1000 });
-
-            if (result.stdout.trim()) {
-              const matches = result.stdout.trim().split("\n").filter(Boolean);
+            const content = readFileSync(logFile, "utf-8");
+            const lines = content.split("\n");
+            const matches = lines.filter((l) => kwRegex.test(l));
+            if (matches.length > 0) {
               totalMatches += matches.length;
               results.push(`   📄 ${logFile}: ${matches.length} alert(s)`);
               matches.slice(0, 5).forEach((m) => results.push(`     ⚠️  ${m.slice(0, 200)}`));
