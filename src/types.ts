@@ -93,7 +93,7 @@ export const FileCompressSchema = z.object({
 
 export const FileArchiveSchema = z.object({
   source: z.string().describe("Source file or directory to organize"),
-  destination: z.string().describe("Destination directory"),
+  destination: z.string().optional().describe("Destination directory"),
   organizeBy: z
     .enum(["date", "type", "size"])
     .optional()
@@ -402,6 +402,100 @@ export const ObsAlertSchema = z.object({
   severity: z.enum(["info", "warning", "critical"]).describe("Alert severity"),
   source: z.string().optional().describe("Alert source identifier"),
   metadata: z.record(z.string()).optional().describe("Additional alert metadata"),
+});
+
+// ============================================================
+// Container / Docker Schemas
+// ============================================================
+
+export const DockerBuildSchema = z.object({
+  directory: z.string().describe("Project directory with Dockerfile"),
+  tag: z.string().describe("Image tag (e.g. myapp:latest)"),
+  dockerfile: z.string().optional().describe("Dockerfile path relative to directory (default: Dockerfile)"),
+  buildArgs: z.record(z.string()).optional().describe("Build arguments (e.g. NODE_VERSION=18)"),
+  noCache: z.boolean().optional().describe("Disable layer caching"),
+});
+
+export const DockerPushSchema = z.object({
+  tag: z.string().describe("Image tag to push"),
+  registry: z.string().optional().describe("Registry URL"),
+  username: z.string().optional().describe("Registry username"),
+  password: z.string().optional().describe("Registry password or token"),
+});
+
+export const DockerComposeUpSchema = z.object({
+  directory: z.string().describe("Project directory with docker-compose.yml"),
+  services: z.array(z.string()).optional().describe("Specific services to start"),
+  detach: z.boolean().optional().describe("Run in detached mode (default: true)"),
+  envFile: z.string().optional().describe("Environment file path"),
+  build: z.boolean().optional().describe("Build images before starting"),
+});
+
+export const DockerComposeDownSchema = z.object({
+  directory: z.string().describe("Project directory with docker-compose.yml"),
+  removeVolumes: z.boolean().optional().describe("Remove named volumes"),
+  removeImages: z.boolean().optional().describe("Remove images used by services"),
+});
+
+// ============================================================
+// Scaffold Schemas
+// ============================================================
+
+export const ScaffoldInitSchema = z.object({
+  template: z.string().describe("Template name (e.g. vue3-app, node-ts, react-app, next-app, express-api)"),
+  name: z.string().describe("Project name"),
+  outputDir: z.string().optional().describe("Output directory (default: ./<name>)"),
+  vars: z.record(z.string()).optional().describe("Template variables"),
+  force: z.boolean().optional().describe("Overwrite existing directory"),
+});
+
+export const ScaffoldAddModuleSchema = z.object({
+  module: z.string().describe("Module type (e.g. vue-component, vite-plugin, express-route)"),
+  name: z.string().describe("Module name"),
+  directory: z.string().optional().describe("Project directory (default: cwd)"),
+});
+
+// ============================================================
+// Secrets Schemas
+// ============================================================
+
+export const SecretGetSchema = z.object({
+  key: z.string().describe("Secret key to retrieve"),
+  profile: z.string().optional().describe("Profile/environment name (default: 'default')"),
+});
+
+export const SecretSetSchema = z.object({
+  key: z.string().describe("Secret key"),
+  value: z.string().describe("Secret value"),
+  profile: z.string().optional().describe("Profile/environment name (default: 'default')"),
+});
+
+export const SecretListSchema = z.object({
+  profile: z.string().optional().describe("Profile/environment name (default: all profiles)"),
+});
+
+export const SecretRemoveSchema = z.object({
+  key: z.string().describe("Secret key to remove"),
+  profile: z.string().optional().describe("Profile/environment name (default: 'default')"),
+});
+
+// ============================================================
+// Webhook Schemas
+// ============================================================
+
+export const WebhookListenSchema = z.object({
+  port: z.number().optional().describe("Port to listen on (default: 8080)"),
+  path: z.string().optional().describe("Webhook path (default: /webhook)"),
+  timeout: z.number().optional().describe("Listen duration in seconds (default: 300)"),
+  secret: z.string().optional().describe("HMAC-SHA256 secret for signature verification"),
+});
+
+export const WebhookFireSchema = z.object({
+  url: z.string().describe("Webhook target URL"),
+  payload: z.record(z.unknown()).describe("JSON payload to send"),
+  headers: z.record(z.string()).optional().describe("Custom headers"),
+  secret: z.string().optional().describe("HMAC secret for signing"),
+  method: z.enum(["POST", "PUT", "PATCH"]).optional().describe("HTTP method (default: POST)"),
 });
 
 // ============================================================

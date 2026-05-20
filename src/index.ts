@@ -12,9 +12,19 @@ import { getDeploymentTools } from "./workflows/deployment.js";
 import { getCodeReviewTools } from "./workflows/code-review.js";
 import { getEtlTools } from "./workflows/etl.js";
 import { getSchedulerTools } from "./workflows/scheduler.js";
+import { getNotifyTools } from "./workflows/notify.js";
+import { getContainerTools } from "./workflows/container.js";
+import { getScaffoldTools } from "./workflows/scaffold.js";
+import { getSecretTools } from "./workflows/secrets.js";
+import { getWebhookTools } from "./workflows/webhook.js";
+import { getWorkflowTools } from "./workflows/workflow-orchestrator.js";
+import { getDatabaseTools } from "./workflows/database.js";
+import { getRemoteTools } from "./workflows/remote.js";
+import { getLogTools } from "./workflows/log-manager.js";
+import { startDaemon } from "./workflows/scheduler.js";
 
 // ---------------------------------------------------------------------------
-// Collect all 26 tools from the 6 workflow modules
+// Collect all tools from the workflow modules
 // ---------------------------------------------------------------------------
 const allTools: ToolDefinition[] = [
   ...getGitWorkflowTools(),
@@ -23,6 +33,15 @@ const allTools: ToolDefinition[] = [
   ...getCodeReviewTools(),
   ...getEtlTools(),
   ...getSchedulerTools(),
+  ...getNotifyTools(),
+  ...getContainerTools(),
+  ...getScaffoldTools(),
+  ...getSecretTools(),
+  ...getWebhookTools(),
+  ...getWorkflowTools(),
+  ...getDatabaseTools(),
+  ...getRemoteTools(),
+  ...getLogTools(),
 ];
 
 // ---------------------------------------------------------------------------

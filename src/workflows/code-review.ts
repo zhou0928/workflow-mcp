@@ -4,10 +4,12 @@ import type { ToolDefinition } from "../types.js";
 import { ReviewRunLintSchema, ReviewRunTestsSchema, ReviewGenerateReportSchema, ReviewCheckStyleSchema } from "../types.js";
 import { exec, detectProjectToolchain } from "../utils/exec.js";
 import { logger } from "../utils/logger.js";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { cwd } from "node:process";
 import { mkdirSync } from "node:fs";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 
 export function getCodeReviewTools(): ToolDefinition[] {
   return [
@@ -209,10 +211,186 @@ export function getCodeReviewTools(): ToolDefinition[] {
         }
       },
     },
-  ];
-}
+    {
+      name: "review_ai_review",
+      description: "AI-powered code review using LLM — analyzes code for architecture, security, logic, and style issues",
+      inputSchema: zToJsonSchema(z.object({
+        directory: z.string().describe("Project directory to review"),
+        filePattern: z.string().optional().describe("File glob pattern to filter (e.g. '**/*.ts', default: all)"),
+        focus: z.array(z.enum(["architecture", "security", "logic", "style", "performance", "all"])).optional().describe("Review focus areas (default: all)"),
+        apiKey: z.string().optional().describe("LLM API key (or set AI_REVIEW_API_KEY env var)"),
+        apiUrl: z.string().optional().describe("LLM API URL (default: OpenAI-compatible, or set AI_REVIEW_API_URL env var)"),
+        model: z.string().optional().describe("Model name (default: 'gpt-4o-mini', or set AI_REVIEW_MODEL env var)"),
+        output: z.string().optional().describe("Output file for the review report"),
+      })),
+      handler: async (args) => {
+        try {
+          const args_ = args as {
+            directory: string;
+            filePattern?: string;
+            focus?: string[];
+            apiKey?: string;
+            apiUrl?: string;
+            model?: string;
+            output?: string;
+          };
 
-function dirname(p: string): string {
-  const lastSep = p.lastIndexOf("/");
-  return lastSep >= 0 ? p.slice(0, lastSep) || "/" : ".";
+          const dir = args_.directory;
+          if (!existsSync(dir)) {
+            return { content: [{ type: "text", text: `Directory not found: ${dir}` }], isError: true };
+          }
+
+          const apiKey = args_.apiKey ?? process.env.AI_REVIEW_API_KEY;
+          const apiUrl = args_.apiUrl ?? process.env.AI_REVIEW_API_URL ?? "https://api.openai.com/v1";
+          const model = args_.model ?? process.env.AI_REVIEW_MODEL ?? "gpt-4o-mini";
+          const pattern = args_.filePattern ?? "*";
+          const focusAreas = args_.focus ?? ["all"];
+          const outFile = args_.output;
+
+          if (!apiKey) {
+            return { content: [{ type: "text", text: "❌ No API key provided. Set AI_REVIEW_API_KEY env var or pass apiKey parameter." }], isError: true };
+          }
+
+          logger.info(`AI review: ${dir} (focus: ${focusAreas.join(", ")})`);
+
+          // Collect files using fs (safe, no shell injection)
+          const files: string[] = [];
+          const collectFiles = (searchDir: string, patternGlob: string): void => {
+            try {
+              const entries = readdirSync(searchDir);
+              for (const entry of entries) {
+                if (entry.startsWith(".") || entry === "node_modules") continue;
+                const fullPath = join(searchDir, entry);
+                try {
+                  const stat = statSync(fullPath);
+                  if (stat.isDirectory()) {
+                    if (files.length < 30) collectFiles(fullPath, patternGlob);
+                  } else if (stat.isFile()) {
+                    const matches = patternGlob === "*" || entry.includes(patternGlob.replace("*", ""));
+                    if (matches) files.push(fullPath);
+                  }
+                } catch { /* skip */ }
+              }
+            } catch { /* skip */ }
+          };
+          collectFiles(dir, pattern);
+
+          if (files.length === 0) {
+            return { content: [{ type: "text", text: "No files found matching the pattern." }] };
+          }
+
+          // Build code context
+          const fileContents: string[] = [];
+          for (const f of files) {
+            try {
+              const relPath = f.replace(dir, "").replace(/^\//, "");
+              const ext = f.split(".").pop()?.toLowerCase();
+              // Skip binary/too-large files
+              if (["jpg", "png", "gif", "svg", "ico", "woff", "ttf", "eot", "mp4", "zip", "gz", "lock"].includes(ext ?? "")) continue;
+              const content = readFileSync(f, "utf-8");
+              if (content.length > 50000) continue; // Skip very large files
+              fileContents.push(`--- ${relPath} ---\n${content.slice(0, 8000)}`);
+            } catch { /* skip unreadable */ }
+          }
+
+          if (fileContents.length === 0) {
+            return { content: [{ type: "text", text: "No readable source files found." }] };
+          }
+
+          const codeBlock = fileContents.join("\n\n").slice(0, 60000);
+          const focusPrompt = focusAreas.includes("all")
+            ? "architecture, security, logic, performance, code style, and potential bugs"
+            : focusAreas.join(", ");
+
+          const prompt = `You are an expert code reviewer. Review the following code for ${focusPrompt}.
+
+Provide a structured review with:
+1. **Critical Issues** (bugs, security vulnerabilities, logic errors)
+2. **Architecture & Design** (coupling, cohesion, patterns)
+3. **Code Quality** (style, naming, duplication, complexity)
+4. **Performance** (bottlenecks, optimization opportunities)
+5. **Specific Suggestions** with file references
+
+For each issue, include: severity (HIGH/MEDIUM/LOW), file, and recommended fix.
+
+Code:
+${codeBlock}`;
+
+          // Call LLM API
+          const payload = JSON.stringify({
+            model,
+            messages: [{ role: "user", content: prompt }],
+            max_tokens: 4000,
+            temperature: 0.1,
+          });
+
+          try {
+            const parsedUrl = new URL(`${apiUrl}/chat/completions`);
+            const isHttps = parsedUrl.protocol === "https:";
+            const requester = isHttps ? httpsRequest : httpRequest;
+
+            const response = await new Promise<string>((resolve, reject) => {
+              const options = {
+                hostname: parsedUrl.hostname,
+                port: parsedUrl.port || (isHttps ? 443 : 80),
+                path: parsedUrl.pathname + parsedUrl.search,
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${apiKey}`,
+                  "Content-Length": Buffer.byteLength(payload).toString(),
+                },
+                timeout: 120_000,
+              };
+
+              const req = requester(options, (res) => {
+                const chunks: Buffer[] = [];
+                res.on("data", (chunk: Buffer) => chunks.push(chunk));
+                res.on("end", () => {
+                  const body = Buffer.concat(chunks).toString("utf-8");
+                  const httpCode = res.statusCode ?? 0;
+                  if (httpCode >= 200 && httpCode < 300) {
+                    resolve(body);
+                  } else {
+                    reject(new Error(`HTTP ${httpCode}: ${body.slice(0, 500)}`));
+                  }
+                });
+              });
+
+              req.on("error", (err) => reject(err));
+              req.on("timeout", () => {
+                req.destroy();
+                reject(new Error("Request timed out after 120s"));
+              });
+
+              req.write(payload);
+              req.end();
+            });
+
+            let reviewContent: string;
+            try {
+              const parsed = JSON.parse(response);
+              reviewContent = parsed.choices?.[0]?.message?.content ?? "No review content returned.";
+            } catch {
+              reviewContent = response.slice(0, 10000);
+            }
+
+            const summary = `🤖 AI Code Review\n   Files analyzed: ${fileContents.length} of ${files.length} matched\n   Focus: ${focusPrompt}\n   Model: ${model}\n\n${reviewContent}`;
+
+            if (outFile) {
+              writeFileSync(outFile, summary, "utf-8");
+              return { content: [{ type: "text", text: `✅ AI review complete. Report saved to ${outFile}\n\n${summary.slice(0, 2000)}...` }] };
+            }
+
+            return { content: [{ type: "text", text: summary }] };
+          } catch (apiErr) {
+            return { content: [{ type: "text", text: `❌ AI review API call failed.\n${apiErr instanceof Error ? apiErr.message : String(apiErr)}` }], isError: true };
+          }
+        } catch (err) {
+          const message = err instanceof z.ZodError ? err.errors.map((e) => e.message).join(", ") : String(err);
+          return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
+        }
+      },
+    },
+  ];
 }

@@ -192,6 +192,7 @@ describe("git_auto_commit", () => {
 
   it("should commit with auto-generated message", async () => {
     exec
+      .mockReturnValueOnce({ stdout: "", stderr: "", exitCode: 0 }) // git add -A
       .mockReturnValueOnce({ stdout: " M src/index.ts\n", stderr: "", exitCode: 0 }) // status
       .mockReturnValueOnce({ stdout: "1 file changed", stderr: "", exitCode: 0 }); // commit
     const result = await tool.handler({ addAll: true });
@@ -223,7 +224,9 @@ describe("git_sync_fork", () => {
   });
 
   it("should fail on fetch error", async () => {
-    exec.mockReturnValueOnce({ stdout: "", stderr: "fetch failed", exitCode: 1 });
+    exec
+      .mockReturnValueOnce({ stdout: "main", stderr: "", exitCode: 0 }) // git rev-parse
+      .mockReturnValueOnce({ stdout: "", stderr: "fetch failed", exitCode: 1 }); // git fetch
     const result = await tool.handler({});
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("fetch");

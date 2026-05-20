@@ -12,15 +12,41 @@ import { cwd } from "node:process";
 function parseCsv(text: string): Record<string, string>[] {
   const lines = text.split("\n").filter((l) => l.trim());
   if (lines.length < 2) return [];
-  const headers = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, ""));
+  const headers = parseCsvLine(lines[0]);
   return lines.slice(1).map((line) => {
-    const values = line.split(",").map((v) => v.trim().replace(/^"|"$/g, ""));
+    const values = parseCsvLine(line);
     const row: Record<string, string> = {};
     headers.forEach((h, i) => {
       row[h] = values[i] ?? "";
     });
     return row;
   });
+}
+
+/** Parse a single CSV line, handling double-quoted fields with embedded commas */
+function parseCsvLine(line: string): string[] {
+  const fields: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        // Escaped quote: ""
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === "," && !inQuotes) {
+      fields.push(current.trim());
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  fields.push(current.trim());
+  return fields;
 }
 
 function toCsv(data: Record<string, string>[]): string {

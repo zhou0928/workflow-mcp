@@ -72,8 +72,12 @@ export function findGitRoot(startPath: string = process.cwd()): string | null {
 }
 
 export function commandExists(command: string): boolean {
+  // Validate: only allow simple command names, reject paths or shell metacharacters
+  if (!/^[a-zA-Z0-9_.-]+$/.test(command)) {
+    return false;
+  }
   try {
-    execSync(`which ${command}`, { encoding: "utf-8", stdio: "ignore" });
+    execSync(`command -v ${command}`, { encoding: "utf-8", stdio: "ignore" });
     return true;
   } catch {
     return false;

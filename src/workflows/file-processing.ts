@@ -156,7 +156,8 @@ export function getFileProcessingTools(): ToolDefinition[] {
           }
 
           const fmt = format ?? (statSync(source).isDirectory() ? "tar.gz" : "zip");
-          const outPath = output ?? `${source}.${fmt.replace("tar.gz", "tar.gz").replace("tar.bz2", "tar.bz2").replace("tar", "tar").replace("zip", "zip")}`;
+          const extMap: Record<string, string> = { zip: "zip", tar: "tar", "tar.gz": "tar.gz", "tar.bz2": "tar.bz2" };
+          const outPath = output ?? `${source}.${extMap[fmt] ?? fmt}`;
 
           let cmd: string;
           switch (fmt) {
@@ -282,18 +283,15 @@ export function getFileProcessingTools(): ToolDefinition[] {
                   if (namePattern && !entry.includes(namePattern)) continue;
                   if (minSize && s.size < minSize) continue;
 
-                  // Compute MD5 hash of first 64KB for speed
-                  const hash = createHash("md5");
-                  const stream = createReadStream(fullPath, { end: 65536 });
-                  const chunks: Buffer[] = [];
-                  for (const chunk of stream.read()) {
-                    if (chunk) chunks.push(chunk);
+                  // Compute MD5 hash
+                  let fileHash = "";
+                  try {
+                    // macOS md5, Linux md5sum
+                    const r = exec(`md5 -q "${fullPath}" 2>/dev/null || md5sum "${fullPath}" | cut -d' ' -f1`, { timeout: 30_000 });
+                    fileHash = r.stdout.trim();
+                  } catch {
+                    // Skip inaccessible files
                   }
-                  // For simplicity, use a full hash via exec
-                  const hashResult = exec(`md5sum "${fullPath}"`, { timeout: 30_000 });
-                  // macOS uses md5
-                  const hashCmd = exec(`md5 -q "${fullPath}" 2>/dev/null || md5sum "${fullPath}" | cut -d' ' -f1`, { timeout: 30_000 });
-                  const fileHash = hashCmd.stdout.trim() || hashResult.stdout.split(" ")[0];
 
                   if (fileHash) {
                     const existing = hashMap.get(fileHash) ?? [];

@@ -4,41 +4,17 @@ import type { ToolDefinition } from "../types.js";
 import { DeployRunSchema, DeployRollbackSchema, DeployStatusSchema, DeployListSchema } from "../types.js";
 import { exec } from "../utils/exec.js";
 import { logger } from "../utils/logger.js";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { getDb } from "../utils/db.js";
+import { existsSync } from "node:fs";
 
 interface DeploymentRecord {
+  id?: number;
   timestamp: string;
   environment: string;
   branch: string;
   version: string;
   status: "success" | "failed" | "rolled_back";
   output: string;
-}
-
-const DATA_DIR = join(process.env.HOME || process.cwd(), ".workflow-mcp");
-const DEPLOYS_FILE = join(DATA_DIR, "deployments.json");
-
-function ensureDataDir(): void {
-  if (!existsSync(DATA_DIR)) {
-    mkdirSync(DATA_DIR, { recursive: true });
-  }
-}
-
-function loadDeployments(): DeploymentRecord[] {
-  ensureDataDir();
-  if (!existsSync(DEPLOYS_FILE)) return [];
-  try {
-    return JSON.parse(readFileSync(DEPLOYS_FILE, "utf-8"));
-  } catch {
-    return [];
-  }
-}
-
-function saveDeployments(deploys: DeploymentRecord[]): void {
-  ensureDataDir();
-  writeFileSync(DEPLOYS_FILE, JSON.stringify(deploys, null, 2), "utf-8");
 }
 
 function generateVersion(): string {
@@ -77,23 +53,24 @@ export function getDeploymentTools(): ToolDefinition[] {
 
           const cmd = script
             ? `${envStr} ${deployScript} ${environment}`
-            : `bash ${deployScript} ${environment} ${deployBranch}`;
+            : `${envStr} bash ${deployScript} ${environment} ${deployBranch}`;
 
           const result = exec(cmd, { cwd: workDir, timeout: 300_000 });
           const version = generateVersion();
 
-          const record: DeploymentRecord = {
+          const db = getDb();
+          const record = {
             timestamp: new Date().toISOString(),
             environment,
             branch: deployBranch,
             version,
-            status: result.exitCode === 0 ? "success" : "failed",
+            status: result.exitCode === 0 ? "success" : "failed" as const,
             output: result.stdout || result.stderr,
           };
 
-          const deploys = loadDeployments();
-          deploys.push(record);
-          saveDeployments(deploys);
+          db.prepare(
+            "INSERT INTO deployments (timestamp, environment, branch, version, status, output) VALUES (?, ?, ?, ?, ?, ?)"
+          ).run(record.timestamp, record.environment, record.branch, record.version, record.status, record.output);
 
           if (result.exitCode !== 0) {
             return {
@@ -118,10 +95,13 @@ export function getDeploymentTools(): ToolDefinition[] {
       handler: async (args) => {
         try {
           const { environment, version } = DeployRollbackSchema.parse(args);
+          const db = getDb();
           logger.info(`Rolling back ${environment}`);
 
-          const deploys = loadDeployments();
-          const envDeploys = deploys.filter((d) => d.environment === environment && d.status === "success");
+          // Get successful deployments for this environment
+          const envDeploys = db.prepare(
+            "SELECT * FROM deployments WHERE environment = ? AND status = 'success' ORDER BY id DESC"
+          ).all(environment) as DeploymentRecord[];
 
           if (envDeploys.length === 0) {
             return { content: [{ type: "text", text: `No successful deployments found for "${environment}".` }], isError: true };
@@ -130,8 +110,8 @@ export function getDeploymentTools(): ToolDefinition[] {
           // Find the target version or the previous one
           let targetVersion = version;
           if (!targetVersion) {
-            const current = envDeploys[envDeploys.length - 1];
-            const previous = envDeploys.length >= 2 ? envDeploys[envDeploys.length - 2] : null;
+            const current = envDeploys[0];
+            const previous = envDeploys.length >= 2 ? envDeploys[1] : null;
             if (!previous) {
               return { content: [{ type: "text", text: `No previous deployment to rollback to for "${environment}".` }], isError: true };
             }
@@ -140,13 +120,13 @@ export function getDeploymentTools(): ToolDefinition[] {
 
           // Mark current as rolled_back
           if (!version) {
-            const current = envDeploys[envDeploys.length - 1];
-            current.status = "rolled_back";
-            saveDeployments(deploys);
+            db.prepare(
+              "UPDATE deployments SET status = 'rolled_back' WHERE id = ?"
+            ).run(envDeploys[0].id);
           }
 
           return {
-            content: [{ type: "text", text: `✅ Rolled back "${environment}" to version ${targetVersion}. Run your deploy script to redeploy that version.` }],
+            content: [{ type: "text", text: `✅ Rolled back "${environment}" to version ${targetVersion}. Run deploy_run to redeploy that version.` }],
           };
         } catch (err) {
           const message = err instanceof z.ZodError ? err.errors.map((e) => e.message).join(", ") : String(err);
@@ -161,25 +141,27 @@ export function getDeploymentTools(): ToolDefinition[] {
       handler: async (args) => {
         try {
           const { environment } = DeployStatusSchema.parse(args);
-          const deploys = loadDeployments();
-          const envDeploys = deploys.filter((d) => d.environment === environment);
+          const db = getDb();
 
-          if (envDeploys.length === 0) {
+          const row = db.prepare(
+            "SELECT * FROM deployments WHERE environment = ? ORDER BY id DESC LIMIT 1"
+          ).get(environment) as DeploymentRecord | undefined;
+
+          if (!row) {
             return { content: [{ type: "text", text: `No deployments found for "${environment}".` }] };
           }
 
-          const latest = envDeploys[envDeploys.length - 1];
           return {
             content: [
               {
                 type: "text",
                 text: [
                   `Environment: ${environment}`,
-                  `Latest Version: ${latest.version}`,
-                  `Status: ${latest.status}`,
-                  `Timestamp: ${latest.timestamp}`,
-                  `Branch: ${latest.branch}`,
-                  latest.output ? `\nOutput:\n${latest.output.slice(0, 2000)}` : "",
+                  `Latest Version: ${row.version}`,
+                  `Status: ${row.status}`,
+                  `Timestamp: ${row.timestamp}`,
+                  `Branch: ${row.branch}`,
+                  row.output ? `\nOutput:\n${row.output.slice(0, 2000)}` : "",
                 ]
                   .filter(Boolean)
                   .join("\n"),
@@ -199,23 +181,26 @@ export function getDeploymentTools(): ToolDefinition[] {
       handler: async (args) => {
         try {
           const { environment, limit } = DeployListSchema.parse(args);
-          let deploys = loadDeployments();
+          const db = getDb();
+          const maxResults = limit ?? 10;
 
+          let rows: DeploymentRecord[];
           if (environment) {
-            deploys = deploys.filter((d) => d.environment === environment);
+            rows = db.prepare(
+              "SELECT * FROM deployments WHERE environment = ? ORDER BY id DESC LIMIT ?"
+            ).all(environment, maxResults) as DeploymentRecord[];
+          } else {
+            rows = db.prepare(
+              "SELECT * FROM deployments ORDER BY id DESC LIMIT ?"
+            ).all(maxResults) as DeploymentRecord[];
           }
 
-          deploys.reverse();
-          const maxResults = limit ?? 10;
-          const sliced = deploys.slice(0, maxResults);
-
-          if (sliced.length === 0) {
+          if (rows.length === 0) {
             return { content: [{ type: "text", text: "No deployments found." }] };
           }
 
-          const lines = sliced.map(
-            (d) =>
-              `[${d.timestamp}] ${d.environment} → ${d.version} (${d.branch}) [${d.status}]`
+          const lines = rows.map(
+            (d) => `[${d.timestamp}] ${d.environment} → ${d.version} (${d.branch}) [${d.status}]`
           );
 
           return {
