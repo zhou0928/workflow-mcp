@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // Mock exec utilities before importing the module under test
 vi.mock("../utils/exec.js", () => ({
-  exec: vi.fn(),
   execSafe: vi.fn(),
   findGitRoot: vi.fn(),
   execAsync: vi.fn(),
@@ -167,7 +166,7 @@ describe("git_merge_branch", () => {
     expect(result.content[0].text).toContain("Merged");
   });
 
-it("should handle merge conflicts", async () => {
+  it("should handle merge conflicts", async () => {
     execSafe
       .mockReturnValueOnce({ stdout: "", stderr: "", exitCode: 0 }) // checkout
       .mockReturnValueOnce({ stdout: "", stderr: "", exitCode: 0 }) // pull
