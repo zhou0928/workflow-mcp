@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { zToJsonSchema } from "../utils/schema.js";
 import type { ToolDefinition } from "../types.js";
-import { exec, commandExists } from "../utils/exec.js";
+import { execSafe, commandExists } from "../utils/exec.js";
 import { logger } from "../utils/logger.js";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -69,28 +69,14 @@ export function getContainerTools(): ToolDefinition[] {
             return { content: [{ type: "text", text: `❌ Directory not found: ${directory}` }], isError: true };
           }
 
-          let cmd = "docker build";
-
-          if (dockerfile) {
-            const dfPath = join(directory, dockerfile);
-            if (!existsSync(dfPath)) {
-              return { content: [{ type: "text", text: `❌ Dockerfile not found: ${dfPath}` }], isError: true };
-            }
-            cmd += ` -f '${dockerfile}'`;
-          }
-
-          if (noCache) cmd += " --no-cache";
-
-          if (buildArgs) {
-            for (const [k, v] of Object.entries(buildArgs)) {
-              cmd += ` --build-arg '${k}=${v}'`;
-            }
-          }
-
-          cmd += ` -t '${tag}' '${directory}'`;
+          const dockerArgs = ["build"];
+          if (dockerfile) dockerArgs.push("-f", dockerfile);
+          if (noCache) dockerArgs.push("--no-cache");
+          if (buildArgs) for (const [k, v] of Object.entries(buildArgs)) dockerArgs.push("--build-arg", `${k}=${v}`);
+          dockerArgs.push("-t", tag, directory);
 
           logger.info(`Building Docker image: ${tag}`);
-          const result = exec(cmd, { timeout: 600_000 });
+          const result = execSafe("docker", dockerArgs, { timeout: 600_000 });
 
           if (result.exitCode !== 0) {
             return {
@@ -123,14 +109,14 @@ export function getContainerTools(): ToolDefinition[] {
           // Login if credentials provided
           if (registry && username && password) {
             logger.info(`Logging into ${registry}`);
-            const loginResult = exec(`echo '${password}' | docker login '${registry}' -u '${username}' --password-stdin`, { timeout: 30_000 });
+            const loginResult = execSafe("docker", ["login", registry, "-u", username, "--password-stdin"], { timeout: 30_000, input: password + "\n" });
             if (loginResult.exitCode !== 0) {
               return { content: [{ type: "text", text: `❌ Registry login failed: ${loginResult.stderr}` }], isError: true };
             }
           }
 
           logger.info(`Pushing image: ${tag}`);
-          const result = exec(`docker push '${tag}'`, { timeout: 600_000 });
+          const result = execSafe("docker", ["push", tag], { timeout: 600_000 });
 
           if (result.exitCode !== 0) {
             return { content: [{ type: "text", text: `❌ Push failed.\n${result.stderr}` }], isError: true };
@@ -161,19 +147,15 @@ export function getContainerTools(): ToolDefinition[] {
             return { content: [{ type: "text", text: `❌ Directory not found: ${directory}` }], isError: true };
           }
 
-          let cmd = `docker compose -f '${join(directory, "docker-compose.yml")}'`;
-
-          if (envFile) {
-            cmd += ` --env-file '${envFile}'`;
-          }
-
-          cmd += " up";
-          if (detach !== false) cmd += " -d";
-          if (build) cmd += " --build";
-          if (services && services.length > 0) cmd += ` ${services.join(" ")}`;
+          const dockerArgs = ["compose", "-f", join(directory, "docker-compose.yml")];
+          if (envFile) dockerArgs.push("--env-file", envFile);
+          dockerArgs.push("up");
+          if (detach !== false) dockerArgs.push("-d");
+          if (build) dockerArgs.push("--build");
+          if (services && services.length > 0) dockerArgs.push(...services);
 
           logger.info(`Starting Docker Compose services in ${directory}`);
-          const result = exec(cmd, { timeout: 300_000 });
+          const result = execSafe("docker", dockerArgs, { timeout: 300_000 });
 
           if (result.exitCode !== 0) {
             return { content: [{ type: "text", text: `❌ Compose up failed.\n${result.stderr}` }], isError: true };
@@ -204,13 +186,12 @@ export function getContainerTools(): ToolDefinition[] {
             return { content: [{ type: "text", text: `❌ Directory not found: ${directory}` }], isError: true };
           }
 
-          let cmd = `docker compose -f '${join(directory, "docker-compose.yml")}' down`;
-
-          if (removeVolumes) cmd += " -v";
-          if (removeImages) cmd += " --rmi all";
+          const dockerArgs = ["compose", "-f", join(directory, "docker-compose.yml"), "down"];
+          if (removeVolumes) dockerArgs.push("-v");
+          if (removeImages) dockerArgs.push("--rmi", "all");
 
           logger.info(`Stopping Docker Compose services in ${directory}`);
-          const result = exec(cmd, { timeout: 120_000 });
+          const result = execSafe("docker", dockerArgs, { timeout: 120_000 });
 
           if (result.exitCode !== 0) {
             return { content: [{ type: "text", text: `❌ Compose down failed.\n${result.stderr}` }], isError: true };

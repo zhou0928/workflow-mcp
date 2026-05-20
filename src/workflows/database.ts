@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { zToJsonSchema } from "../utils/schema.js";
 import type { ToolDefinition } from "../types.js";
-import { exec } from "../utils/exec.js";
+import { execSafe } from "../utils/exec.js";
 import { logger } from "../utils/logger.js";
 import { getDb } from "../utils/db.js";
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
@@ -62,24 +62,29 @@ function runSqliteQuery(dbPath: string, query: string, params?: unknown[]): { ro
 }
 
 function runExternalDb(type: string, query: string, connection: string, params?: unknown[]): { rows: Record<string, unknown>[]; affected: number } {
-  // Use CLI tools for external databases
-  let cmd: string;
+  // Use CLI tools for external databases — no shell to avoid injection
+  let result: import("../utils/exec.js").ExecResult;
 
   switch (type) {
-    case "postgres":
-      cmd = `psql "${connection}" -c ${JSON.stringify(query)} --csv -t 2>/dev/null || echo "PG_ERROR"`;
+    case "postgres": {
+      result = execSafe("psql", [connection, "-c", query, "--csv", "-t"], { timeout: 30_000 });
       break;
+    }
     case "mysql":
-    case "mariadb":
-      cmd = `mysql -e ${JSON.stringify(query)} ${connection ? `-h $(echo "${connection}" | cut -d: -f1) -P $(echo "${connection}" | cut -d: -f2)` : ""} 2>/dev/null || echo "MYSQL_ERROR"`;
+    case "mariadb": {
+      // connection format: host:port (e.g. localhost:3306)
+      const [host, portStr] = connection ? connection.split(":") : ["localhost", "3306"];
+      const args = ["-h", host];
+      if (portStr) args.push("-P", portStr);
+      args.push("-e", query);
+      result = execSafe("mysql", args, { timeout: 30_000 });
       break;
+    }
     default:
       throw new Error(`Unsupported database type: ${type}`);
   }
 
-  const result = exec(cmd, { timeout: 30_000 });
-
-  if (result.exitCode !== 0 || result.stderr) {
+  if (result.exitCode !== 0) {
     throw new Error(`Database query failed: ${result.stderr || result.stdout}`);
   }
 

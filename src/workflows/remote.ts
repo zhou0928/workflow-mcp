@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { zToJsonSchema } from "../utils/schema.js";
 import type { ToolDefinition } from "../types.js";
-import { exec } from "../utils/exec.js";
+import { execSafe } from "../utils/exec.js";
 import { logger } from "../utils/logger.js";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -54,15 +54,15 @@ const RemoteTunnelSchema = z.object({
 // Helpers
 // ============================================================
 
-function buildSshBase(host: string, port?: number, username?: string, keyPath?: string): string {
-  const parts: string[] = ["ssh"];
-  if (port && port !== 22) parts.push(`-p ${port}`);
-  if (keyPath) parts.push(`-i '${keyPath}'`);
-  parts.push("-o StrictHostKeyChecking=accept-new");
-  parts.push("-o ConnectTimeout=10");
+function buildSshArgs(host: string, port?: number, username?: string, keyPath?: string): string[] {
+  const args: string[] = [];
+  if (port && port !== 22) args.push("-p", String(port));
+  if (keyPath) args.push("-i", keyPath);
+  args.push("-o", "StrictHostKeyChecking=accept-new");
+  args.push("-o", "ConnectTimeout=10");
   const user = username ?? process.env.USER;
-  parts.push(`-T ${user}@${host}`);
-  return parts.join(" ");
+  args.push("-T", `${user}@${host}`);
+  return args;
 }
 
 // ============================================================
@@ -80,11 +80,11 @@ export function getRemoteTools(): ToolDefinition[] {
           const { host, command, port, username, keyPath, timeout } = RemoteExecSchema.parse(args);
           const t = (timeout ?? 60) * 1000;
 
-          const sshBase = buildSshBase(host, port, username, keyPath);
-          const cmd = `${sshBase} ${JSON.stringify(command)}`;
+          const sshArgs = buildSshArgs(host, port, username, keyPath);
+          sshArgs.push(command);
 
           logger.info(`Remote exec: ${host} — ${command.slice(0, 100)}`);
-          const result = exec(cmd, { timeout: t });
+          const result = execSafe("ssh", sshArgs, { timeout: t });
 
           if (result.exitCode !== 0) {
             return {
@@ -111,21 +111,22 @@ export function getRemoteTools(): ToolDefinition[] {
           const { host, source, destination, direction, port, username, keyPath } = RemoteCopySchema.parse(args);
 
           const user = username ?? process.env.USER;
-          const portFlag = port && port !== 22 ? `-P ${port}` : "";
-          const keyFlag = keyPath ? `-i '${keyPath}'` : "";
+          const scpArgs: string[] = [];
+          if (port && port !== 22) scpArgs.push("-P", String(port));
+          if (keyPath) scpArgs.push("-i", keyPath);
+          scpArgs.push("-o", "StrictHostKeyChecking=accept-new", "-r");
 
-          let cmd: string;
           if (direction === "upload") {
             if (!existsSync(source)) {
               return { content: [{ type: "text", text: `❌ Local file not found: ${source}` }], isError: true };
             }
-            cmd = `scp ${portFlag} ${keyFlag} -o StrictHostKeyChecking=accept-new -r '${source}' ${user}@${host}:'${destination}'`;
+            scpArgs.push(source, `${user}@${host}:${destination}`);
           } else {
-            cmd = `scp ${portFlag} ${keyFlag} -o StrictHostKeyChecking=accept-new -r ${user}@${host}:'${source}' '${destination}'`;
+            scpArgs.push(`${user}@${host}:${source}`, destination);
           }
 
           logger.info(`Remote copy: ${direction} ${source} → ${host}:${destination}`);
-          const result = exec(cmd, { timeout: 120_000 });
+          const result = execSafe("scp", scpArgs, { timeout: 120_000 });
 
           if (result.exitCode !== 0) {
             return {
@@ -156,27 +157,31 @@ export function getRemoteTools(): ToolDefinition[] {
 
           const user = username ?? process.env.USER;
           const remotePath = `/tmp/remote_script_${randomUUID().slice(0, 8)}.sh`;
-          const portFlag = port && port !== 22 ? `-P ${port}` : "";
-          const keyFlag = keyPath ? `-i '${keyPath}'` : "";
-          const sshOpts = "-o StrictHostKeyChecking=accept-new";
+          const scpArgs: string[] = [];
+          if (port && port !== 22) scpArgs.push("-P", String(port));
+          if (keyPath) scpArgs.push("-i", keyPath);
+          scpArgs.push("-o", "StrictHostKeyChecking=accept-new", scriptPath, `${user}@${host}:${remotePath}`);
 
           // Upload script
-          const uploadCmd = `scp ${portFlag} ${keyFlag} ${sshOpts} '${scriptPath}' ${user}@${host}:'${remotePath}'`;
-          const uploadResult = exec(uploadCmd, { timeout: 30_000 });
+          logger.info(`Uploading script to ${host}:${remotePath}`);
+          const uploadResult = execSafe("scp", scpArgs, { timeout: 30_000 });
 
           if (uploadResult.exitCode !== 0) {
             return { content: [{ type: "text", text: `❌ Script upload failed.\n${uploadResult.stderr}` }], isError: true };
           }
 
           // Execute remote script
-          const sshBase = buildSshBase(host, port, username, keyPath);
-          const execCmd = `${sshBase} "chmod +x '${remotePath}' && '${remotePath}' ${scriptArgs ?? ""}"`;
+          const sshArgs = buildSshArgs(host, port, username, keyPath);
+          const remoteCmd = `chmod +x '${remotePath}' && '${remotePath}' ${scriptArgs ?? ""}`;
+          sshArgs.push(remoteCmd);
           logger.info(`Remote script: ${host} — ${scriptPath}`);
 
-          const result = exec(execCmd, { timeout: t });
+          const result = execSafe("ssh", sshArgs, { timeout: t });
 
           // Cleanup
-          exec(`${sshBase} "rm -f '${remotePath}'"`, { timeout: 10_000 });
+          const cleanupArgs = buildSshArgs(host, port, username, keyPath);
+          cleanupArgs.push(`rm -f '${remotePath}'`);
+          execSafe("ssh", cleanupArgs, { timeout: 10_000 });
 
           if (result.exitCode !== 0) {
             return {
@@ -204,15 +209,17 @@ export function getRemoteTools(): ToolDefinition[] {
           const bg = background ?? true;
 
           const user = username ?? process.env.USER;
-          const sshPort = port && port !== 22 ? `-p ${port}` : "";
-          const keyFlag = keyPath ? `-i '${keyPath}'` : "";
-          const bgFlag = bg ? "-f" : "";
-          const sshOpts = "-o StrictHostKeyChecking=accept-new -o ExitOnForwardFailure=yes";
-
-          const cmd = `ssh ${sshPort} ${keyFlag} ${sshOpts} ${bgFlag} -L ${localPort}:${remoteHost}:${remotePort} ${user}@${host} -N`;
+          const tunnelArgs: string[] = [];
+          if (port && port !== 22) tunnelArgs.push("-p", String(port));
+          if (keyPath) tunnelArgs.push("-i", keyPath);
+          tunnelArgs.push("-o", "StrictHostKeyChecking=accept-new");
+          tunnelArgs.push("-o", "ExitOnForwardFailure=yes");
+          if (bg) tunnelArgs.push("-f");
+          tunnelArgs.push("-L", `${localPort}:${remoteHost}:${remotePort}`);
+          tunnelArgs.push("-N", `${user}@${host}`);
 
           logger.info(`SSH tunnel: localhost:${localPort} → ${host}:${remotePort}`);
-          const result = exec(cmd, { timeout: bg ? 15_000 : 300_000 });
+          const result = execSafe("ssh", tunnelArgs, { timeout: bg ? 15_000 : 300_000 });
 
           if (result.exitCode !== 0) {
             return {

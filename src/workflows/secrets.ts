@@ -1,9 +1,8 @@
 import { z } from "zod";
 import { zToJsonSchema } from "../utils/schema.js";
 import type { ToolDefinition } from "../types.js";
-import { exec } from "../utils/exec.js";
 import { logger } from "../utils/logger.js";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "node:crypto";
 
@@ -50,7 +49,7 @@ function getMasterKey(): Buffer {
     const key = randomBytes(32).toString("hex");
     writeFileSync(MASTER_KEY_FILE, key, "utf-8");
     // Restrict permissions
-    exec(`chmod 600 '${MASTER_KEY_FILE}'`, { timeout: 5_000 });
+    chmodSync(MASTER_KEY_FILE, 0o600);
     return Buffer.from(key, "hex");
   }
   return Buffer.from(readFileSync(MASTER_KEY_FILE, "utf-8").trim(), "hex");
@@ -110,7 +109,7 @@ function saveProfile(profile: string, secrets: Record<string, string>): void {
     encrypted[k] = encrypt(v, masterKey);
   }
   writeFileSync(getProfileFile(profile), JSON.stringify(encrypted, null, 2), "utf-8");
-  exec(`chmod 600 '${getProfileFile(profile)}'`, { timeout: 5_000 });
+  chmodSync(getProfileFile(profile), 0o600);
 }
 
 // ============================================================
@@ -180,11 +179,15 @@ export function getSecretTools(): ToolDefinition[] {
 
           // List all profiles
           ensureDir();
-          const files = exec(`ls -1 '${DATA_DIR}' 2>/dev/null | grep '\\.json$' || true`, { timeout: 5_000 });
-          const profiles = files.stdout
-            .split("\n")
-            .filter(Boolean)
-            .map((f) => f.replace(/\.json$/, ""));
+          let profiles: string[] = [];
+          try {
+            const allFiles = readdirSync(DATA_DIR);
+            profiles = allFiles
+              .filter((f) => f.endsWith(".json"))
+              .map((f) => f.replace(/\.json$/, ""));
+          } catch {
+            // Directory doesn't exist yet
+          }
 
           if (profiles.length === 0) {
             return { content: [{ type: "text", text: "No secrets stored." }] };

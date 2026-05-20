@@ -1,6 +1,6 @@
 # workflow-mcp 工作流文档
 
-本文档覆盖所有 11 个工作流领域的 39 个工具。原有 6 个工作流（Git、File Processing、Code Review、Deployment、ETL、Scheduler）请参考已有文档，本文重点说明 **5 个新增工作流**。
+本文档覆盖所有 15 个工作流领域的 53 个工具。本文重点说明 **5 个新增工作流**（Notify、Container、Scaffold、Secrets、Webhook），其余 10 个工作流请参考已有文档或 README。
 
 ---
 

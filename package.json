@@ -9,6 +9,7 @@
     "start": "node dist/index.js",
     "start:daemon": "node dist/index.js --start-daemon",
     "dev": "tsc --watch",
+    "test": "vitest run",
     "prepare": "npm run build"
   },
   "dependencies": {

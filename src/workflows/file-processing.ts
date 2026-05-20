@@ -8,9 +8,9 @@ import {
   FileArchiveSchema,
   FileFindDuplicatesSchema,
 } from "../types.js";
-import { exec } from "../utils/exec.js";
+import { execSafe, commandExists } from "../utils/exec.js";
 import { logger } from "../utils/logger.js";
-import { readdirSync, statSync, renameSync, existsSync, mkdirSync, copyFileSync, unlinkSync, createReadStream, createWriteStream } from "node:fs";
+import { readdirSync, statSync, renameSync, existsSync, mkdirSync, copyFileSync, unlinkSync, createReadStream, createWriteStream, readFileSync } from "node:fs";
 import { join, extname, dirname, basename, relative } from "node:path";
 import { createHash } from "node:crypto";
 
@@ -79,8 +79,8 @@ export function getFileProcessingTools(): ToolDefinition[] {
           }
 
           // Use imagemagick (convert) or ffmpeg for conversion
-          const hasConvert = exec("which convert", {}).exitCode === 0;
-          const hasFfmpeg = exec("which ffmpeg", {}).exitCode === 0;
+          const hasConvert = commandExists("convert");
+          const hasFfmpeg = commandExists("ffmpeg");
 
           if (!hasConvert && !hasFfmpeg) {
             return {
@@ -118,14 +118,12 @@ export function getFileProcessingTools(): ToolDefinition[] {
           const results: string[] = [];
           for (const file of files) {
             const outPath = file.slice(0, -fromExt.length) + toExt;
-            let cmd: string;
+            let r: import("../utils/exec.js").ExecResult;
             if (hasConvert) {
-              cmd = `convert "${file}" "${outPath}"`;
+              r = execSafe("convert", [file, outPath], { timeout: 120_000 });
             } else {
-              cmd = `ffmpeg -i "${file}" "${outPath}" -y`;
+              r = execSafe("ffmpeg", ["-i", file, outPath, "-y"], { timeout: 120_000 });
             }
-
-            const r = exec(cmd, { timeout: 120_000 });
             if (r.exitCode === 0) {
               results.push(`Converted: ${basename(file)} → ${basename(outPath)}`);
               if (!keepOriginal) unlinkSync(file);
@@ -159,25 +157,26 @@ export function getFileProcessingTools(): ToolDefinition[] {
           const extMap: Record<string, string> = { zip: "zip", tar: "tar", "tar.gz": "tar.gz", "tar.bz2": "tar.bz2" };
           const outPath = output ?? `${source}.${extMap[fmt] ?? fmt}`;
 
-          let cmd: string;
+          let fmtArg: string[];
           switch (fmt) {
             case "zip":
-              cmd = `zip -r "${outPath}" "${source}"`;
+              fmtArg = ["-r", outPath, source];
               break;
             case "tar":
-              cmd = `tar -cf "${outPath}" "${source}"`;
+              fmtArg = ["-cf", outPath, source];
               break;
             case "tar.gz":
-              cmd = `tar -czf "${outPath}" "${source}"`;
+              fmtArg = ["-czf", outPath, source];
               break;
             case "tar.bz2":
-              cmd = `tar -cjf "${outPath}" "${source}"`;
+              fmtArg = ["-cjf", outPath, source];
               break;
             default:
               return { content: [{ type: "text", text: `Unsupported format: ${fmt}` }], isError: true };
           }
 
-          const r = exec(cmd, { timeout: 120_000 });
+          const tool = fmt === "zip" ? "zip" : "tar";
+          const r = execSafe(tool, fmtArg, { timeout: 120_000 });
           if (r.exitCode !== 0) {
             return { content: [{ type: "text", text: `Compression failed: ${r.stderr}` }], isError: true };
           }
@@ -283,12 +282,13 @@ export function getFileProcessingTools(): ToolDefinition[] {
                   if (namePattern && !entry.includes(namePattern)) continue;
                   if (minSize && s.size < minSize) continue;
 
-                  // Compute MD5 hash
+                  // Compute MD5 hash via Node.js crypto (no shell)
                   let fileHash = "";
                   try {
-                    // macOS md5, Linux md5sum
-                    const r = exec(`md5 -q "${fullPath}" 2>/dev/null || md5sum "${fullPath}" | cut -d' ' -f1`, { timeout: 30_000 });
-                    fileHash = r.stdout.trim();
+                    const hash = createHash("md5");
+                    const content = readFileSync(fullPath);
+                    hash.update(content);
+                    fileHash = hash.digest("hex");
                   } catch {
                     // Skip inaccessible files
                   }

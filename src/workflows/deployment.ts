@@ -2,7 +2,7 @@ import { z } from "zod";
 import { zToJsonSchema } from "../utils/schema.js";
 import type { ToolDefinition } from "../types.js";
 import { DeployRunSchema, DeployRollbackSchema, DeployStatusSchema, DeployListSchema } from "../types.js";
-import { exec } from "../utils/exec.js";
+import { execSafe } from "../utils/exec.js";
 import { logger } from "../utils/logger.js";
 import { getDb } from "../utils/db.js";
 import { existsSync } from "node:fs";
@@ -45,17 +45,13 @@ export function getDeploymentTools(): ToolDefinition[] {
             };
           }
 
-          // Build env vars
-          const envVars = { ...vars };
-          const envStr = Object.entries(envVars)
-            .map(([k, v]) => `${k}=${v}`)
-            .join(" ");
+          // Build env vars safely — pass via options.env, not shell
+          const env = { ...process.env, ...vars, DEPLOY_BRANCH: deployBranch, DEPLOY_ENVIRONMENT: environment } as Record<string, string>;
 
-          const cmd = script
-            ? `${envStr} ${deployScript} ${environment}`
-            : `${envStr} bash ${deployScript} ${environment} ${deployBranch}`;
+          const scriptArgs = [environment];
+          if (!script) scriptArgs.push(deployBranch);
 
-          const result = exec(cmd, { cwd: workDir, timeout: 300_000 });
+          const result = execSafe(deployScript, scriptArgs, { cwd: workDir, timeout: 300_000, env });
           const version = generateVersion();
 
           const db = getDb();

@@ -1,4 +1,4 @@
-import { execSync, exec as execCallback } from "node:child_process";
+import { execSync, exec as execCallback, spawnSync, type SpawnSyncOptions } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -69,6 +69,37 @@ export function findGitRoot(startPath: string = process.cwd()): string | null {
     current = parent;
   }
   return null;
+}
+
+export function execSafe(
+  command: string,
+  args: string[],
+  options?: { cwd?: string; timeout?: number; input?: string; env?: Record<string, string> }
+): ExecResult {
+  try {
+    const spawnOpts: SpawnSyncOptions = {
+      encoding: "utf-8" as const,
+      cwd: options?.cwd,
+      timeout: options?.timeout ?? 60_000,
+      stdio: ["pipe", "pipe", "pipe"],
+      input: options?.input,
+    };
+    if (options?.env) {
+      spawnOpts.env = { ...process.env, ...options.env } as Record<string, string>;
+    }
+    const result = spawnSync(command, args, spawnOpts);
+    return {
+      stdout: (result.stdout ?? "").toString().trim(),
+      stderr: (result.stderr ?? "").toString().trim(),
+      exitCode: result.status ?? 1,
+    };
+  } catch (err: unknown) {
+    return {
+      stdout: "",
+      stderr: String(err),
+      exitCode: 1,
+    };
+  }
 }
 
 export function commandExists(command: string): boolean {
